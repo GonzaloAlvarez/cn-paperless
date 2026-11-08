@@ -59,7 +59,8 @@ fi
 log "waiting for the Paperless API (up to 5m; first boot runs migrations)"
 for i in $(seq 1 60); do
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Accept: application/json; version=10' http://localhost:8000/api/ || true)"
-  if [[ "$code" == "401" || "$code" == "200" ]]; then log "API answers (HTTP $code) after ${i}x5s"; break; fi
+  # unauthenticated /api/ answers 302 (→ login) or 401 depending on Accept; both mean "up"
+  if [[ "$code" =~ ^(200|302|401)$ ]]; then log "API answers (HTTP $code) after ${i}x5s"; break; fi
   sleep 5
   [[ $i -eq 60 ]] && die "API never answered on localhost:8000 (last HTTP '$code') — docker compose logs webserver"
 done
