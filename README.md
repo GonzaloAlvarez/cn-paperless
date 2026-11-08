@@ -44,7 +44,7 @@ On kaiser (fresh clone):
 ```sh
 git clone https://github.com/GonzaloAlvarez/cn-paperless ~/cn-paperless && cd ~/cn-paperless
 kauket get kaiser.cn_paperless_env
-./setup.sh          # NFS checks, render, up, wait, scripts/bootstrap.sh (prints the scanner + metrics tokens ONCE)
+./setup.sh          # NFS checks, render, up, wait, scripts/bootstrap.py (prints the scanner + metrics tokens ONCE)
 amun docker         # boot unit (NFS-gated, after cn-books), reconcile cron, nightly export cron
 ```
 
@@ -61,8 +61,8 @@ Put the two printed tokens where they belong — `PAPERLESS_TOKEN` into `printer
 ## Identity and permissions
 
 - **Groups are capabilities.** Authentik `documents` → Paperless group `documents` (synced at every login by `PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS`); Authentik `infra-admins` → superuser (`PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP`). New SSO users are auto-created (`PAPERLESS_SOCIAL_AUTO_SIGNUP`); local signups are closed.
-- **Workflow "Household documents"** (created by `scripts/bootstrap.sh`): every consumed document — whatever the source — gets view + change permission for `documents`. Without it, documents uploaded by `scanner` would be visible only to `scanner` and superusers.
-- **Service users**: `scanner` (member of `documents`; the printer forwarder's token) and `metrics` (staff, view-only; the exporter's token). Tokens are printed once at creation; losing one means deleting the user under `/admin/` and re-running `scripts/bootstrap.sh`.
+- **Workflow "Household documents"** (created by `scripts/bootstrap.py`): every consumed document — whatever the source — gets view + change permission for `documents`. Without it, documents uploaded by `scanner` would be visible only to `scanner` and superusers.
+- **Service users**: `scanner` (member of `documents`; the printer forwarder's token) and `metrics` (staff, view-only; the exporter's token). Tokens are printed once at creation; losing one means deleting the user under `/admin/` and re-running `scripts/bootstrap.py`.
 - **Break-glass**: the `PAPERLESS_ADMIN_USER` superuser (first-boot only; password in Kauket) through the local login form or `https://docs.lab.gn.al/admin/`. If Authentik is down, nothing else is needed.
 
 ## Scanning and importing

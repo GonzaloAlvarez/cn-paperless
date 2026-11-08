@@ -7,7 +7,7 @@
 #   kauket get kaiser.cn_paperless_env
 #   ./setup.sh
 # Checks the NFS contract, renders promtail + the exporter token, brings the
-# stack up, waits for the API and runs scripts/bootstrap.sh (idempotent).
+# stack up, waits for the API and runs scripts/bootstrap.py (idempotent).
 # Re-run after `git pull` or a `kauket get`. It never generates secrets.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -45,7 +45,7 @@ TOKEN_FILE=exporter/auth-token.txt
 OLD_TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
 NEW_TOKEN="$(env_get PAPERLESS_METRICS_TOKEN)"
 (umask 077; printf '%s' "$NEW_TOKEN" > "$TOKEN_FILE")
-[[ -n "$NEW_TOKEN" ]] || warn "PAPERLESS_METRICS_TOKEN empty — paperless-exporter will 401 until scripts/bootstrap.sh's token is in Kauket"
+[[ -n "$NEW_TOKEN" ]] || warn "PAPERLESS_METRICS_TOKEN empty — paperless-exporter will 401 until scripts/bootstrap.py's token is in Kauket"
 
 # ── bring the stack up ──────────────────────────────────────────────────────
 log "docker compose up -d --remove-orphans"
@@ -66,7 +66,8 @@ for i in $(seq 1 60); do
 done
 
 log "bootstrap (group, users, tags, workflow — idempotent)"
-scripts/bootstrap.sh
+command -v python3 >/dev/null || die "python3 is required for scripts/bootstrap.py"
+scripts/bootstrap.py
 
 LAB_DOMAIN="$(env_get LAB_DOMAIN)"; LAB_DOMAIN="${LAB_DOMAIN:-lab.gn.al}"
 LAN_DOMAIN="$(env_get LAN_DOMAIN)"; LAN_DOMAIN="${LAN_DOMAIN:-kaiser.lan}"
