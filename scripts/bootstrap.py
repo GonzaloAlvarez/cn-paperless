@@ -124,15 +124,24 @@ def ensure_group(name, perms):
 
 
 def ensure_tag(name):
+    # Tags are UNOWNED (owner null) so every user — the household and the
+    # `scanner` service user — can see and reuse them. An owned tag is invisible
+    # to other users, and the forwarder would then create a duplicate.
     code, resp = api("GET", f"/tags/?name__iexact={urllib.parse.quote(name)}")
     existing = first(resp) if code == 200 else None
     if existing:
-        log(f"  ✓ tag {name} (id={existing['id']})")
+        if existing.get("owner") is not None:
+            code, resp = api("PATCH", f"/tags/{existing['id']}/", {"owner": None})
+            if code != 200:
+                die(f"PATCH tag {name} owner: {code} {resp}")
+            log(f"  ✓ tag {name} (id={existing['id']}, owner cleared)")
+        else:
+            log(f"  ✓ tag {name} (id={existing['id']})")
         return existing["id"]
-    code, resp = api("POST", "/tags/", {"name": name, "matching_algorithm": 0, "is_inbox_tag": False})
+    code, resp = api("POST", "/tags/", {"name": name, "matching_algorithm": 0, "is_inbox_tag": False, "owner": None})
     if code != 201:
         die(f"POST tag {name}: {code} {resp}")
-    log(f"  + tag {name} (id={resp['id']})")
+    log(f"  + tag {name} (id={resp['id']}, unowned)")
     return resp["id"]
 
 

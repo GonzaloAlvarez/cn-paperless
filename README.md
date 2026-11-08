@@ -91,6 +91,7 @@ Health checks first: `docker compose ps` · `docker compose logs --tail=50 webse
 
 ## Gotchas
 
+- **Tags must be unowned.** Paperless hides owned objects from other users: a tag created by the admin is invisible to `scanner`, which then creates a same-named duplicate (happened on the first real scan, 2026-11-07). `scripts/bootstrap.py` creates `scanned`/`gdrive-import` with `owner: null` and clears the owner on existing ones; tags created through the UI by a person follow the same rule if the household should see them.
 - **Host header**: `PAPERLESS_URL` sets `ALLOWED_HOSTS`; anything that hits the app with another name gets HTTP 400. Local probes use `http://localhost:8000` (always allowed), never `127.0.0.1`.
 - **`USERMAP_UID=1024`**: the container `chown`s `data/`, `media/`, `consume/`, `export/` to `1024:100` on start — expected for the NFS tree (Synology ACL owner), and why `./export` and `./consume` on kaiser end up owned by 1024.
 - **No Docker DNS in the netns** — pinned addresses only; `extra_hosts` does not apply to `network_mode: service:`.
