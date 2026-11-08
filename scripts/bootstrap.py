@@ -167,7 +167,8 @@ def ensure_workflow(name, group_id):
     # 3 mail, 4 web UI. action type 1 = Assignment.
     payload = {
         "name": name, "order": 0, "enabled": True,
-        "triggers": [{"type": 1, "sources": [1, 2, 3, 4], "matching_algorithm": 0}],
+        # a Consumption trigger must carry a filename/path/mail filter: "*" = everything
+        "triggers": [{"type": 1, "sources": [1, 2, 3, 4], "filter_filename": "*", "matching_algorithm": 0}],
         "actions": [{"type": 1, "assign_view_groups": [group_id], "assign_change_groups": [group_id]}],
     }
     if existing:
