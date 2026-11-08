@@ -1,0 +1,10 @@
+.env
+certs/
+exporter/auth-token.txt
+promtail/promtail.yml
+consume/
+export/
+backups/
+.bootstrap-done
+*.bak
+.DS_Store

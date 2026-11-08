@@ -1,0 +1,38 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://${INFRA_VPS_TAILNET_IP}:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: cn-paperless-docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=cn-paperless"]
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: app
+      - source_labels: ["__meta_docker_container_name"]
+        target_label: container
+      - target_label: stack
+        replacement: cn-paperless
+      - target_label: host
+        replacement: docs
+
+  - job_name: cn-paperless-journal
+    journal:
+      max_age: 12h
+      labels:
+        job: systemd-journal
+        stack: cn-paperless
+        host: docs
+    relabel_configs:
+      - source_labels: ["__journal__systemd_unit"]
+        target_label: unit

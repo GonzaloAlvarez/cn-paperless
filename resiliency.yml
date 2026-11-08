@@ -1,0 +1,21 @@
+# amun-docker resiliency manifest — installs a docker-compose@cn-paperless boot
+# unit (NFS-mount-gated) + an /etc/cron.d reconcile job + the nightly export.
+# See amun-docker README.
+boot:
+  enabled: true
+  # The document media tree lives on the raidnas NFS mount; gate boot on it and
+  # tear the stack down if the mount itself fails (BindsTo the derived .mount
+  # unit) rather than starting Paperless against the empty local placeholder.
+  nfs_mount: /home/gonzalo/docker/data/nfs
+  binds_to_mount: true
+  require_paths:
+    - /home/gonzalo/docker/data/nfs/paperless/media
+  # kaiser NFS chain: cn-bittorrent → cn-media → cn-roms → cn-books → cn-paperless
+  after: [cn-books]
+reconcile:
+  enabled: true
+  schedule: "*/5 * * * *"
+cron:
+  # Nightly incremental document_exporter run into ./export (what offen ships
+  # off-site on Sunday 05:30). 04:30 keeps clear of the 03:00-04:15 backup jobs.
+  - { name: export, schedule: "30 4 * * *", script: scripts/export.sh }

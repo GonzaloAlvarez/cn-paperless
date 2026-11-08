@@ -1,0 +1,477 @@
+# cn-paperless — Paperless-ngx (scan → OCR → tag → search) on kaiser.lan.
+#
+# Shape: homelab "sidecar stack" (cn-fitness is the reference). ts-docs owns the
+# netns; the Paperless webserver and the exporters join it, so one tailnet
+# identity (docs.ts.gn.al, tag:svc) serves the VPS traefik-lab and the sidecar's
+# published 127.0.0.1:8000 serves cn-home's traefik-lan. Canonical origin is
+# https://docs.lab.gn.al on both sides (split horizon); docs.kaiser.lan 301s to
+# it in cn-home because the OIDC redirect URI is strict.
+#
+# Postgres, Valkey, Tika and Gotenberg stay on the project bridge with
+# IPAM-pinned addresses: inside the sidecar's netns tailscaled owns resolv.conf,
+# so Docker DNS names do not resolve there (same rule as cn-roms/cn-fitness).
+#
+# State: the document tree (originals, archive PDFs, thumbnails) lives on the
+# raidnas NFS export /volume1/data/paperless/media and is written as the NFS
+# identity 1024:100 (USERMAP_*); the search index, classifier and the database
+# stay on local volumes. Boot and reconcile are NFS-gated (resiliency.yml +
+# mount-precheck): a placeholder directory must never look like the library.
+#
+# Backups: pg-dump every 12h (./backups) + nightly document_exporter into
+# ./export (scripts/export.sh, resiliency cron) and offen ships both to S3
+# cloudnet-lab-storage/paperless/ + raidnas WebDAV /paperless/ on Sunday 05:30.
+services:
+  # ── NFS preflight: refuse to start on a placeholder directory ─────────────
+  mount-precheck:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mountpoint -q /nfs-check || { echo "FAIL: NFS not mounted at /home/gonzalo/docker/data/nfs"; exit 1; }
+        # Assert it's REALLY the NFS share, not the empty local placeholder a
+        # failed mount leaves behind (cn-roms/cn-media outage, 2026-06-22).
+        test "$$(stat -f -c %T /nfs-check)" = nfs || { echo "FAIL: /nfs-check is not nfs ($$(stat -f -c %T /nfs-check)) — refusing to start on placeholder"; exit 1; }
+        test -d /nfs-check/paperless/media || { echo "FAIL: /paperless/media missing on NFS (sudo install -d -o 1024 -g 100 /home/gonzalo/docker/data/nfs/paperless/media)"; exit 1; }
+        echo "NFS OK ($$(df -h /nfs-check | tail -1 | awk '{print $$4}') free)"
+    volumes:
+      - /home/gonzalo/docker/data/nfs:/nfs-check:ro
+    restart: "no"
+
+  # ── Tailscale sidecar: owns the netns shared by webserver + exporters ─────
+  ts-docs:
+    image: tailscale/tailscale:latest
+    hostname: ts-docs
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${DOCS_AUTHKEY}
+      - TS_HOSTNAME=docs
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+    ports:
+      # Host port 8000 — confirmed free on kaiser (ss -tlnp, 2026-11-07).
+      # Paperless listens on 8000 inside the netns; traefik-lan dials it here.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      mount-precheck:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Postgres: Paperless's database. Project bridge, pinned IP ─────────────
+  db:
+    image: postgres:18.3-alpine
+    networks:
+      default:
+        ipv4_address: 172.30.8.10
+    environment:
+      - POSTGRES_DB=${PAPERLESS_DB_NAME}
+      - POSTGRES_USER=${PAPERLESS_DB_USER}
+      - POSTGRES_PASSWORD=${PAPERLESS_DB_PASSWORD}
+    volumes:
+      # postgres 18+ wants the mount at /var/lib/postgresql (PGDATA lives in a
+      # major-version subdir so pg_upgrade --link works) — see cn-fitness.
+      - db_data:/var/lib/postgresql
+    labels:
+      # Pinned major; a blind bump would need a dump/restore. Bump by hand.
+      com.centurylinklabs.watchtower.enable: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Valkey: Celery broker + cache ─────────────────────────────────────────
+  redis:
+    image: docker.io/valkey/valkey:9-alpine
+    networks:
+      default:
+        ipv4_address: 172.30.8.11
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # ── Tika + Gotenberg: office documents (docx/xlsx/pptx/odt…) → text + PDF ─
+  # Needed because the Google Drive migration keeps Docs/Sheets/Slides as
+  # editable Office originals; Paperless renders the PDF archive copy itself.
+  # Pinned to the tags upstream's docker-compose.postgres-tika.yml ships.
+  tika:
+    image: docker.io/apache/tika:3.3.1.0
+    networks:
+      default:
+        ipv4_address: 172.30.8.12
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
+
+  gotenberg:
+    image: docker.io/gotenberg/gotenberg:8.38
+    networks:
+      default:
+        ipv4_address: 172.30.8.13
+    # Upstream's hardening: no JavaScript, Chromium may only open the files
+    # Paperless hands it.
+    command:
+      - "gotenberg"
+      - "--chromium-disable-javascript=true"
+      - "--chromium-allow-list=^file:///tmp/.*"
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
+
+  # ── Paperless-ngx webserver + consumer + task workers (one container) ─────
+  # Pinned tag, monitor-only in Watchtower: the image migrates the schema on
+  # boot (like Outline), so updates are read-the-notes-then-bump. Unpin
+  # condition: none — keep the pin, bump deliberately.
+  webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2
+    network_mode: "service:ts-docs"
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      tika:
+        condition: service_started
+      gotenberg:
+        condition: service_started
+    environment:
+      # Database / broker / converters by pinned bridge address (no Docker DNS
+      # inside the sidecar's netns).
+      - PAPERLESS_DBENGINE=postgresql
+      - PAPERLESS_DBHOST=172.30.8.10
+      - PAPERLESS_DBPORT=5432
+      - PAPERLESS_DBNAME=${PAPERLESS_DB_NAME}
+      - PAPERLESS_DBUSER=${PAPERLESS_DB_USER}
+      - PAPERLESS_DBPASS=${PAPERLESS_DB_PASSWORD}
+      - PAPERLESS_REDIS=redis://172.30.8.11:6379
+      - PAPERLESS_TIKA_ENABLED=1
+      - PAPERLESS_TIKA_ENDPOINT=http://172.30.8.12:9998
+      - PAPERLESS_TIKA_GOTENBERG_ENDPOINT=http://172.30.8.13:3000
+      # Canonical origin (ALLOWED_HOSTS + CSRF + CORS come from this). Both
+      # Traefiks pass the real Host and X-Forwarded-Proto.
+      - PAPERLESS_URL=https://docs.${LAB_DOMAIN}
+      - PAPERLESS_USE_X_FORWARD_HOST=true
+      - PAPERLESS_USE_X_FORWARD_PORT=true
+      - 'PAPERLESS_PROXY_SSL_HEADER=["HTTP_X_FORWARDED_PROTO", "https"]'
+      # LAN traefik-lan arrives via Docker DNAT as the bridge gateway; the VPS
+      # traefik-lab arrives from infra-vps over the tailnet.
+      - PAPERLESS_TRUSTED_PROXIES=172.30.8.1,127.0.0.1,${INFRA_VPS_TAILNET_IP}
+      # RETAINED: signs sessions/CSRF; rotating it logs everyone out. Kauket.
+      - PAPERLESS_SECRET_KEY=${PAPERLESS_SECRET_KEY}
+      # NFS writer identity for /volume1/data (Synology ACL owner 1024:100).
+      - USERMAP_UID=1024
+      - USERMAP_GID=100
+      - PAPERLESS_TIME_ZONE=${TIMEZONE}
+      - PAPERLESS_OCR_LANGUAGE=${PAPERLESS_OCR_LANGUAGE:-eng+spa}
+      # auto = OCR only pages without a text layer (v3 semantics); Office docs
+      # always get a PDF rendition via Gotenberg regardless.
+      - PAPERLESS_OCR_MODE=auto
+      # Human-readable tree on the NAS: 2026/Correspondent/Title.pdf. Changing
+      # it later needs `document_renamer`.
+      - PAPERLESS_FILENAME_FORMAT={{ created_year }}/{{ correspondent }}/{{ title }}
+      - PAPERLESS_TASK_WORKERS=2
+      - PAPERLESS_THREADS_PER_WORKER=4
+      # Break-glass superuser, created on the FIRST boot only (ignored after).
+      - PAPERLESS_ADMIN_USER=${PAPERLESS_ADMIN_USER}
+      - PAPERLESS_ADMIN_MAIL=${ADMIN_EMAIL}
+      - PAPERLESS_ADMIN_PASSWORD=${PAPERLESS_ADMIN_PASSWORD}
+      # ── Native OIDC (django-allauth) against Authentik's canonical issuer.
+      # Reached over the tailnet → VPS traefik-lab (LE, nothing extra to trust),
+      # same path cn-librechat uses. Callback registered in Authentik:
+      #   https://docs.lab.gn.al/accounts/oidc/authentik/login/callback/
+      # `groups` is requested so SYNC_GROUPS maps Authentik groups onto the
+      # Paperless groups of the same name (`documents`) and `infra-admins`
+      # grants superuser. Values come from cn-authentik/setup-paperless-oidc.sh.
+      - PAPERLESS_APPS=allauth.socialaccount.providers.openid_connect
+      - 'PAPERLESS_SOCIALACCOUNT_PROVIDERS={"openid_connect":{"SCOPE":["openid","profile","email","groups"],"APPS":[{"provider_id":"authentik","name":"Authentik","client_id":"${OIDC_CLIENT_ID}","secret":"${OIDC_CLIENT_SECRET}","settings":{"server_url":"${OIDC_SERVER_URL}"}}]}}'
+      - PAPERLESS_SOCIAL_AUTO_SIGNUP=true
+      - PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS=true
+      - PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP=infra-admins
+      - PAPERLESS_ACCOUNT_ALLOW_SIGNUPS=false
+      # false keeps the local form (break-glass admin, Android app, scanner
+      # token login); flip to true once everyone is on SSO.
+      - PAPERLESS_REDIRECT_LOGIN_TO_SSO=${PAPERLESS_REDIRECT_LOGIN_TO_SSO:-false}
+      # Mail (password reset for local accounts, share-by-mail) — shared Mailgun.
+      - PAPERLESS_EMAIL_HOST=${SMTP_HOST}
+      - PAPERLESS_EMAIL_PORT=${SMTP_PORT}
+      - PAPERLESS_EMAIL_HOST_USER=${SMTP_USERNAME}
+      - PAPERLESS_EMAIL_HOST_PASSWORD=${SMTP_PASSWORD}
+      - PAPERLESS_EMAIL_FROM=${SMTP_FROM}
+      - PAPERLESS_EMAIL_USE_TLS=true
+    volumes:
+      - paperless_data:/usr/src/paperless/data                              # index, classifier, logs (local)
+      - /home/gonzalo/docker/data/nfs/paperless/media:/usr/src/paperless/media   # originals + archive + thumbs (raidnas)
+      - ./consume:/usr/src/paperless/consume                                 # drop folder (local; the scanner uses the API)
+      - ./export:/usr/src/paperless/export                                   # document_exporter target (offen ships it)
+    labels:
+      com.centurylinklabs.watchtower.monitor-only: "true"
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes docs.lab.gn.al routable via traefik-lab ──
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-docs"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=docs.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          NAME=$$1; PORT=$$2; SUB=$$3
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-paperless",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$SUB.$$LAB_DOMAIN -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register docs 8000 docs
+          sleep 60
+        done
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-docs"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: stack-level host metrics into VPS Prometheus (:9100) ──
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-docs"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── postgres-exporter: DB metrics (:9187) ──
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    network_mode: "service:ts-docs"
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${PAPERLESS_DB_USER}:${PAPERLESS_DB_PASSWORD}@172.30.8.10:5432/${PAPERLESS_DB_NAME}?sslmode=disable
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── paperless-exporter: app metrics via the REST API (:8081) ──
+  # Reads with the `metrics` user's token (scripts/bootstrap.sh mints it;
+  # setup.sh renders exporter/auth-token.txt from PAPERLESS_METRICS_TOKEN).
+  # Collectors that need Django admin rights (log, group, user) and the
+  # outbound version check are left out.
+  paperless-exporter:
+    image: ghcr.io/hansmi/prometheus-paperless-exporter:v0.0.10
+    network_mode: "service:ts-docs"
+    init: true
+    command:
+      - "--collectors=tag,correspondent,document_type,storage_path,task,document,statistics,status"
+    environment:
+      - PAPERLESS_URL=http://localhost:8000
+      - PAPERLESS_AUTH_TOKEN_FILE=/etc/exporter/auth-token.txt
+      - PAPERLESS_SERVER_TIMEZONE=${TIMEZONE}
+    volumes:
+      - ./exporter:/etc/exporter:ro     # directory mount: a re-rendered token needs only a restart
+    depends_on:
+      ts-docs:
+        condition: service_healthy
+      webserver:
+        condition: service_started
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # pinned
+    restart: unless-stopped
+
+  # ── pg-dump: app-consistent Postgres dumps every 12h to ./backups ──
+  pg-dump:
+    image: prodrigestivill/postgres-backup-local:18
+    environment:
+      - POSTGRES_HOST=172.30.8.10
+      - POSTGRES_DB=${PAPERLESS_DB_NAME}
+      - POSTGRES_USER=${PAPERLESS_DB_USER}
+      - POSTGRES_PASSWORD=${PAPERLESS_DB_PASSWORD}
+      - POSTGRES_EXTRA_OPTS=--format=custom --blobs --compress=6
+      - SCHEDULE=@every 12h
+      - BACKUP_KEEP_DAYS=14
+      - BACKUP_KEEP_WEEKS=8
+      - BACKUP_KEEP_MONTHS=6
+      - HEALTHCHECK_PORT=8080
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── offen: weekly off-site tar of the export tree + pg dumps ──
+  # Window Sun 05:30 (librechat 05:00, mzfxa 04:30). The export tree is a full
+  # copy of the documents: watch its size (switch to restic past ~20 GB).
+  backup:
+    image: offen/docker-volume-backup:v2.43.4
+    environment:
+      - BACKUP_CRON_EXPRESSION=30 5 * * 0
+      - BACKUP_FILENAME=paperless-%Y-%m-%dT%H-%M-%S.tar.gz
+      - BACKUP_RETENTION_DAYS=56
+      - AWS_S3_BUCKET_NAME=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${BACKUP_AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${BACKUP_AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_REGION=${BACKUP_AWS_REGION}
+      - AWS_S3_PATH=paperless/
+      - WEBDAV_URL=${BACKUP_WEBDAV_URL}
+      - WEBDAV_PATH=/paperless/
+      - WEBDAV_USERNAME=${BACKUP_WEBDAV_USER}
+      - WEBDAV_PASSWORD=${BACKUP_WEBDAV_PASSWORD}
+      - NOTIFICATION_URLS=smtp://${SMTP_USERNAME}:${SMTP_PASSWORD}@${SMTP_HOST}:${SMTP_PORT}/?from=${SMTP_FROM}&to=${ALERT_EMAIL}&starttls=yes
+      - NOTIFICATION_LEVEL=info
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./backups:/backup/pg-dumps:ro
+      - ./export:/backup/export:ro
+    restart: unless-stopped
+
+  # ── ts-docs watchdog: force-recreate dependents on netns drift ──
+  # Copied whole from cn-fitness (see its comment block): compares each
+  # dependent's HostConfig.NetworkMode with the live sidecar id and, after 3
+  # polls (~30 s) of persistent drift, recreates them; also starts dependents
+  # stuck in a non-running state.
+  ts-docs-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        until apk add --no-cache docker-cli-compose >/dev/null 2>&1; do echo "[watchdog] waiting for network to install docker-cli-compose"; sleep 5; done
+        DEPS="webserver consul-register promtail node-exporter postgres-exporter paperless-exporter"
+        ACTION_THRESHOLD=3
+        ACTION_COUNT=0
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS), drift threshold $$ACTION_THRESHOLD polls"
+        while true; do
+          TS_ID=$$(docker inspect cn-paperless-ts-docs-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            NEED_RECREATE=""
+            NEED_START=""
+            for dep in $$DEPS; do
+              INFO=$$(docker inspect cn-paperless-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
+              fi
+            done
+            if [ -n "$$NEED_RECREATE" ] || [ -n "$$NEED_START" ]; then
+              ACTION_COUNT=$$((ACTION_COUNT + 1))
+              if [ "$$ACTION_COUNT" -ge "$$ACTION_THRESHOLD" ]; then
+                if [ -n "$$NEED_RECREATE" ]; then
+                  echo "[watchdog] persistent drift on:$$NEED_RECREATE -- recreating"
+                  docker compose -p cn-paperless up -d --force-recreate --no-deps $$NEED_RECREATE \
+                    && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+                fi
+                if [ -n "$$NEED_START" ]; then
+                  echo "[watchdog] persistent stopped on:$$NEED_START -- starting"
+                  docker compose -p cn-paperless start $$NEED_START \
+                    && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+                fi
+                ACTION_COUNT=0
+              else
+                echo "[watchdog] action pending (drift:$$NEED_RECREATE start:$$NEED_START count=$$ACTION_COUNT/$$ACTION_THRESHOLD)"
+              fi
+            else
+              ACTION_COUNT=0
+            fi
+          fi
+          sleep 10
+        done
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        # 172.30.8.0/24 — next in the fleet sequence (0 roms, 1 fitness, 2 books,
+        # 3 librechat, 4 exercises, 5 nvr, 6 printer, 7 llmrouter). Pins live in
+        # .10-.13; dynamic allocation stays in the upper half.
+        - subnet: 172.30.8.0/24
+          ip_range: 172.30.8.128/25
+
+volumes:
+  ts_state:
+  db_data:
+  redis_data:
+  paperless_data:
