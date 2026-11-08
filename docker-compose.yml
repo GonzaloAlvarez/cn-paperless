@@ -193,7 +193,11 @@ services:
       - PAPERLESS_THREADS_PER_WORKER=4
       # Break-glass superuser, created on the FIRST boot only (ignored after).
       - PAPERLESS_ADMIN_USER=${PAPERLESS_ADMIN_USER}
-      - PAPERLESS_ADMIN_MAIL=${ADMIN_EMAIL}
+      # NOT the operator's address: allauth refuses to auto-link an SSO login to
+      # a local account that already owns the e-mail ("An account already
+      # exists with this email address"), so the break-glass admin keeps a
+      # distinct one and the SSO users are created separately.
+      - PAPERLESS_ADMIN_MAIL=${PAPERLESS_ADMIN_MAIL:-admin@docs.lab.gn.al}
       - PAPERLESS_ADMIN_PASSWORD=${PAPERLESS_ADMIN_PASSWORD}
       # ── Native OIDC (django-allauth) against Authentik's canonical issuer.
       # Reached over the tailnet → VPS traefik-lab (LE, nothing extra to trust),
