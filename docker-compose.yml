@@ -201,13 +201,22 @@ services:
       - PAPERLESS_ADMIN_PASSWORD=${PAPERLESS_ADMIN_PASSWORD}
       # ── Native OIDC (django-allauth) against Authentik's canonical issuer.
       # Reached over the tailnet → VPS traefik-lab (LE, nothing extra to trust),
-      # same path cn-librechat uses. Callback registered in Authentik:
-      #   https://docs.lab.gn.al/accounts/oidc/authentik/login/callback/
+      # same path cn-librechat uses. TWO provider entries:
+      #   authentik      confidential web client; callback
+      #                  https://docs.lab.gn.al/accounts/oidc/authentik/login/callback/
+      #   authentik-app  the PUBLIC client (no secret, PKCE) the phone apps use —
+      #                  Less Paper takes the provider Paperless advertises and
+      #                  redeems the code itself with atlp://oidc-callback, which a
+      #                  confidential client cannot serve; its web callback is
+      #                  https://docs.lab.gn.al/accounts/oidc/authentik-app/login/callback/
+      # EMAIL_AUTHENTICATION(+AUTO_CONNECT) links a login through either entry to
+      # the existing user with that (verified) e-mail instead of a signup page.
       # `groups` is requested so SYNC_GROUPS maps Authentik groups onto the
       # Paperless groups of the same name (`documents`) and `infra-admins`
-      # grants superuser. Values come from cn-authentik/setup-paperless-oidc.sh.
+      # grants superuser. Values come from cn-authentik/setup-paperless-oidc.sh;
+      # the public client id is not a secret and defaults to this instance's.
       - PAPERLESS_APPS=allauth.socialaccount.providers.openid_connect
-      - 'PAPERLESS_SOCIALACCOUNT_PROVIDERS={"openid_connect":{"SCOPE":["openid","profile","email","groups"],"APPS":[{"provider_id":"authentik","name":"Authentik","client_id":"${OIDC_CLIENT_ID}","secret":"${OIDC_CLIENT_SECRET}","settings":{"server_url":"${OIDC_SERVER_URL}"}}]}}'
+      - 'PAPERLESS_SOCIALACCOUNT_PROVIDERS={"openid_connect":{"OAUTH_PKCE_ENABLED":true,"EMAIL_AUTHENTICATION":true,"EMAIL_AUTHENTICATION_AUTO_CONNECT":true,"SCOPE":["openid","profile","email","groups"],"APPS":[{"provider_id":"authentik","name":"Authentik","client_id":"${OIDC_CLIENT_ID}","secret":"${OIDC_CLIENT_SECRET}","settings":{"server_url":"${OIDC_SERVER_URL}"}},{"provider_id":"authentik-app","name":"Authentik (apps)","client_id":"${OIDC_APP_CLIENT_ID:-Y1ZhPJAjSimJl4Odp7W2a7Tse4Dsw5d8U9acBwWI}","secret":"","settings":{"server_url":"${OIDC_APP_SERVER_URL:-https://auth.lab.gn.al/application/o/paperless-ios/.well-known/openid-configuration}"}}]}}'
       - PAPERLESS_SOCIAL_AUTO_SIGNUP=true
       - PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS=true
       - PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP=infra-admins

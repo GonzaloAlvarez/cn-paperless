@@ -56,6 +56,7 @@ Put the two printed tokens where they belong — `PAPERLESS_TOKEN` into `printer
 | LAN alias | `https://docs.kaiser.lan` | 301 to the canonical name |
 | API | `https://docs.lab.gn.al/api/` | `Authorization: Token …`, `Accept: application/json; version=10` |
 | iOS | [Swift Paperless](https://swift-paperless.app/) | OIDC login via the `paperless-ios` public client (redirect `x-paperless://oidc-callback`), or an API token |
+| iOS | [Less Paper](https://github.com/plu/less-paper) | pick the **"Authentik (apps)"** provider Paperless advertises: it redeems the code itself (PKCE, no secret, redirect `atlp://oidc-callback`), which only the public client allows; the login auto-links to your existing user by e-mail |
 | Android | Paperless Mobile | username/password or API token (no OIDC in that app) |
 
 ## Identity and permissions
