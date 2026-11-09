@@ -12,7 +12,8 @@ HTTP Basic on the loopback-published API) and ensures:
   - user `scanner` (member of `documents`, no superuser) + API token: the
     identity cn-printer's forwarder uploads with (printer.cn_printer_env
     PAPERLESS_TOKEN).
-  - user `metrics` (staff, view-only) + API token: paperless-exporter
+  - user `metrics` (staff, view-only, member of `documents` so it can see the
+    household's documents) + API token: paperless-exporter
     (PAPERLESS_METRICS_TOKEN in this stack's .env → exporter/auth-token.txt).
   - tags `scanned` and `gdrive-import`.
   - workflow "Household documents": every consumed document gets view +
@@ -203,7 +204,10 @@ def main():
     ensure_tag("gdrive-import")
     log("users")
     ensure_user("scanner", [gid], [], False, "PAPERLESS_TOKEN")
-    ensure_user("metrics", [], METRICS_PERMS, True, "PAPERLESS_METRICS_TOKEN")
+    # metrics joins `documents` too: object-level permissions hide other users'
+    # documents, so a group-less exporter user reports 0 documents in
+    # /api/statistics/ and /api/documents/ (seen 2026-11-09).
+    ensure_user("metrics", [gid], METRICS_PERMS, True, "PAPERLESS_METRICS_TOKEN")
     log("workflow")
     ensure_workflow("Household documents", gid)
     with open(os.path.join(ROOT, ".bootstrap-done"), "w") as f:
